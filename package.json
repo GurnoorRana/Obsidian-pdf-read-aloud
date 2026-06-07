@@ -1,0 +1,25 @@
+{
+  "name": "obsidian-pdf-read-aloud",
+  "version": "1.1.0",
+  "description": "Reads open PDF files aloud using the Web Speech API. Includes play, pause, stop, skip controls, speed adjustment, voice selection, and click-to-start.",
+  "main": "main.js",
+  "scripts": {
+    "lint": "eslint main.js"
+  },
+  "keywords": [
+    "obsidian",
+    "obsidian-plugin",
+    "pdf",
+    "text-to-speech",
+    "tts",
+    "accessibility",
+    "read-aloud"
+  ],
+  "author": "Gurnoor Rana",
+  "license": "MIT",
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "@obsidianmd/eslint-plugin": "^0.2.0",
+    "eslint": "^9.0.0"
+  }
+}

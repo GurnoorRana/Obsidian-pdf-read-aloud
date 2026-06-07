@@ -5,6 +5,8 @@
   - Read from cursor position (click in PDF text layer → "Read from here")
   - Read selection only (select text → "Read selection")
   - Speed, pitch, volume, voice controls
+  - Voice dropdown reloads on voiceschanged event
+  - No innerHTML usage (XSS-safe)
 */
 
 const { Plugin, PluginSettingTab, Setting, Notice, ItemView, Menu } = require('obsidian');
@@ -16,6 +18,7 @@ const DEFAULT_SETTINGS = {
   pitch: 1.0,
   volume: 1.0,
   voiceURI: '',
+  skipSize: 5,
 };
 
 class PdfReadAloudPlugin extends Plugin {
@@ -28,11 +31,15 @@ class PdfReadAloudPlugin extends Plugin {
     this.isPlaying = false;
     this.sentences = [];
     this.currentIndex = 0;
-    this.endIndex = -1;          // -1 = play to end; set for selection mode
+    this.endIndex = -1;
     this.statusBarEl = null;
-    this.mode = 'idle';          // 'idle' | 'playing' | 'paused' | 'finished'
-    this._pdfDoc = null;         // cached pdfDocument
-    this._clickHandler = null;   // bound handler for PDF text layer clicks
+    this.mode = 'idle';
+    this._pdfDoc = null;
+    this._clickHandler = null;
+
+    // Reload voice list whenever the browser finishes populating it
+    this._voicesChangedHandler = () => this.refreshPanel();
+    window.speechSynthesis.addEventListener('voiceschanged', this._voicesChangedHandler);
 
     this.registerView(VIEW_TYPE, (leaf) => new ControlPanelView(leaf, this));
 
@@ -42,12 +49,12 @@ class PdfReadAloudPlugin extends Plugin {
     this.updateStatusBar('Idle');
 
     // ── Commands ────────────────────────────────────────────────────────────────
-    this.addCommand({ id: 'pdf-read-aloud-play',       name: 'Play / Resume',         callback: () => this.play() });
-    this.addCommand({ id: 'pdf-read-aloud-pause',      name: 'Pause',                 callback: () => this.pause() });
-    this.addCommand({ id: 'pdf-read-aloud-stop',       name: 'Stop',                  callback: () => this.stop() });
-    this.addCommand({ id: 'pdf-read-aloud-panel',      name: 'Open control panel',    callback: () => this.activateView() });
-    this.addCommand({ id: 'pdf-read-aloud-selection',  name: 'Read selected text',    callback: () => this.readSelection() });
-    this.addCommand({ id: 'pdf-read-aloud-from-click', name: 'Enable click-to-start', callback: () => this.enableClickMode() });
+    this.addCommand({ id: 'play',         name: 'Play / Resume',         callback: () => this.play() });
+    this.addCommand({ id: 'pause',        name: 'Pause',                 callback: () => this.pause() });
+    this.addCommand({ id: 'stop',         name: 'Stop',                  callback: () => this.stop() });
+    this.addCommand({ id: 'open-panel',   name: 'Open control panel',    callback: () => this.activateView() });
+    this.addCommand({ id: 'read-selection', name: 'Read selected text',  callback: () => this.readSelection() });
+    this.addCommand({ id: 'click-to-start', name: 'Enable click-to-start', callback: () => this.enableClickMode() });
 
     // Listen for right-click in PDF viewer to inject context menu items
     this.registerDomEvent(document, 'contextmenu', (evt) => this._onContextMenu(evt), true);
@@ -58,6 +65,9 @@ class PdfReadAloudPlugin extends Plugin {
   onunload() {
     this.stop();
     this._detachClickHandler();
+    if (this._voicesChangedHandler) {
+      window.speechSynthesis.removeEventListener('voiceschanged', this._voicesChangedHandler);
+    }
   }
 
   // ── View ─────────────────────────────────────────────────────────────────────
@@ -80,10 +90,14 @@ class PdfReadAloudPlugin extends Plugin {
     _seen.add(obj);
     if (key in obj) return obj[key];
     for (const k of Object.keys(obj)) {
-      try {
-        const r = this._deepFind(obj[k], key, maxDepth, _depth + 1, _seen);
-        if (r !== undefined) return r;
-      } catch (_) {}
+      const val = obj[k];
+      // Only recurse into plain objects — skip DOM nodes, arrays of primitives, etc.
+      if (val && typeof val === 'object' && !Array.isArray(val) && !(val instanceof HTMLElement)) {
+        try {
+          const r = this._deepFind(val, key, maxDepth, _depth + 1, _seen);
+          if (r !== undefined) return r;
+        } catch (_) { /* ignore access errors on restricted properties */ }
+      }
     }
   }
 
@@ -98,48 +112,49 @@ class PdfReadAloudPlugin extends Plugin {
   async _getPdfDoc() {
     const view = this._getPdfView();
     if (!view) return null;
-    let doc =
+
+    // Try well-known paths first (fast)
+    const doc =
       view?.viewer?.pdfViewer?.pdfDocument ||
       view?.viewer?.pdfViewer?._pdfDocument ||
       view?.pdfViewer?.pdfDocument ||
       view?.pdfViewer?._pdfDocument ||
       view?.viewer?.child?.pdfViewer?.pdfDocument ||
-      view?.viewer?.child?.pdfViewer?._pdfDocument ||
-      this._deepFind(view, 'pdfDocument') ||
-      this._deepFind(view, '_pdfDocument');
-    if (!doc) {
-      try {
-        const comp = view?.viewer;
-        if (comp) {
-          const child = Object.values(comp).find(v => v && typeof v === 'object' && (v.pdfDocument || v._pdfDocument));
-          if (child) doc = child.pdfDocument || child._pdfDocument;
-        }
-      } catch (_) {}
-    }
-    return doc || null;
+      view?.viewer?.child?.pdfViewer?._pdfDocument;
+    if (doc) return doc;
+
+    // Fallback: deep search (slower, but handles unusual internal structures)
+    return this._deepFind(view, 'pdfDocument') ||
+           this._deepFind(view, '_pdfDocument') ||
+           null;
   }
 
   // Extract text from ALL pages, returning array of {pageNum, sentences[]}
   async _extractAllPages() {
     const pdfDoc = await this._getPdfDoc();
     if (!pdfDoc) {
-      new Notice('Could not access PDF. Click on the PDF tab and wait for it to load.');
+      new Notice('Could not access PDF. Click on the PDF tab and wait for it to load fully.');
       return null;
     }
+
     new Notice('Extracting PDF text…');
     const numPages = pdfDoc.numPages;
-    const allSentences = [];  // [{text, page}]
+    const allSentences = [];
 
     for (let i = 1; i <= numPages; i++) {
-      const page = await pdfDoc.getPage(i);
-      const content = await page.getTextContent();
-      const pageText = content.items.map(item => item.str).join(' ').replace(/\s+/g, ' ').trim();
-      if (!pageText) continue;
-      const sentences = pageText
-        .split(/(?<=[.!?])\s+/)
-        .filter(s => s.trim().length > 2)
-        .map(s => ({ text: s.trim(), page: i }));
-      allSentences.push(...sentences);
+      try {
+        const page = await pdfDoc.getPage(i);
+        const content = await page.getTextContent();
+        const pageText = content.items.map(item => item.str).join(' ').replace(/\s+/g, ' ').trim();
+        if (!pageText) continue;
+        const sentences = pageText
+          .split(/(?<=[.!?])\s+/)
+          .filter(s => s.trim().length > 2)
+          .map(s => ({ text: s.trim(), page: i }));
+        allSentences.push(...sentences);
+      } catch (err) {
+        console.warn(`PDF Read Aloud: error reading page ${i}`, err);
+      }
     }
 
     if (allSentences.length === 0) {
@@ -152,24 +167,22 @@ class PdfReadAloudPlugin extends Plugin {
   // ── Context Menu injection ────────────────────────────────────────────────────
 
   _onContextMenu(evt) {
-    // Only act when inside a PDF text layer
     const target = evt.target;
     if (!target.closest('.pdf-viewer, .pdfViewer, canvas, .textLayer')) return;
 
     const selection = window.getSelection()?.toString()?.trim();
 
-    // Delay so Obsidian's own menu fires first, then we append to it
     setTimeout(() => {
       const menu = new Menu();
       if (selection && selection.length > 0) {
         menu.addItem(item =>
-          item.setTitle('🔊 Read selected text')
+          item.setTitle('Read selected text')
               .setIcon('volume-2')
               .onClick(() => this.readSelection())
         );
       }
       menu.addItem(item =>
-        item.setTitle('▶ Read from here')
+        item.setTitle('Read from here')
             .setIcon('play')
             .onClick(() => this._readFromClick(evt))
       );
@@ -201,16 +214,13 @@ class PdfReadAloudPlugin extends Plugin {
   }
 
   async _readFromClick(evt) {
-    // Get any text the user clicked near using the selection API
     let clickedText = '';
 
-    // Try to get text from a text layer span if clicked directly
     const target = evt.target;
     if (target.tagName === 'SPAN' && target.textContent) {
       clickedText = target.textContent.trim();
     }
 
-    // Fall back to current selection
     if (!clickedText) {
       clickedText = window.getSelection()?.toString()?.trim() || '';
     }
@@ -224,7 +234,6 @@ class PdfReadAloudPlugin extends Plugin {
     let startIdx = 0;
 
     if (clickedText.length > 3) {
-      // Find the sentence that best contains the clicked text
       const lower = clickedText.toLowerCase().slice(0, 60);
       let bestIdx = -1;
       let bestScore = 0;
@@ -239,7 +248,6 @@ class PdfReadAloudPlugin extends Plugin {
         startIdx = bestIdx;
         new Notice(`Starting from: "${sentences[startIdx].text.slice(0, 50)}…"`);
       } else {
-        // Try word-level fuzzy match
         const words = lower.split(/\s+/).slice(0, 5);
         sentences.forEach((s, i) => {
           const st = s.text.toLowerCase();
@@ -270,7 +278,6 @@ class PdfReadAloudPlugin extends Plugin {
       return;
     }
 
-    // If we already have sentences loaded, try to find the selection range in them
     let sentences = this.sentences;
     if (!sentences || sentences.length === 0) {
       sentences = await this._extractAllPages();
@@ -279,12 +286,9 @@ class PdfReadAloudPlugin extends Plugin {
     }
 
     const selLower = sel.toLowerCase();
-
-    // Find first sentence that overlaps selection start
     let startIdx = -1;
     let endIdx = -1;
 
-    // Split selection into sentences too, use first & last to bracket
     const selSentences = sel.split(/(?<=[.!?])\s+/).map(s => s.trim().toLowerCase()).filter(Boolean);
     const firstSnippet = selSentences[0]?.slice(0, 40) || selLower.slice(0, 40);
     const lastSnippet  = selSentences[selSentences.length - 1]?.slice(0, 40) || selLower.slice(-40);
@@ -299,7 +303,6 @@ class PdfReadAloudPlugin extends Plugin {
       }
     });
 
-    // If we couldn't bracket properly, just split the raw selection
     if (startIdx === -1) {
       new Notice('Reading selected text directly.');
       this.stop();
@@ -328,7 +331,6 @@ class PdfReadAloudPlugin extends Plugin {
   // ── Playback engine ───────────────────────────────────────────────────────────
 
   async play() {
-    // Resume from pause
     if (this.isPaused && this.synth.paused) {
       this.synth.resume();
       this.isPaused = false;
@@ -339,7 +341,6 @@ class PdfReadAloudPlugin extends Plugin {
     }
     if (this.isPlaying) return;
 
-    // Fresh play from start
     const sentences = await this._extractAllPages();
     if (!sentences) return;
     this.sentences = sentences;
@@ -390,9 +391,7 @@ class PdfReadAloudPlugin extends Plugin {
     };
 
     this.utterance = utt;
-    const total = this.endIndex >= 0 ? (this.endIndex - this.currentIndex + 1) : this.sentences.length;
-    const pos   = this.endIndex >= 0 ? (index - (this.currentIndex) + 1) : index + 1;
-    const pg    = this.sentences[index]?.page;
+    const pg = this.sentences[index]?.page;
     this.updateStatusBar(`▶ ${index + 1}/${this.sentences.length}${pg ? ` (p.${pg})` : ''}`);
     this.refreshPanel();
     this.synth.speak(utt);
@@ -421,14 +420,14 @@ class PdfReadAloudPlugin extends Plugin {
     if (!this.isPlaying && !this.isPaused) return;
     this.synth.cancel();
     this.isPaused = false;
-    this.speakFrom(Math.min(this.currentIndex + 5, this.sentences.length - 1));
+    this.speakFrom(Math.min(this.currentIndex + this.settings.skipSize, this.sentences.length - 1));
   }
 
   skipBack() {
     if (!this.isPlaying && !this.isPaused) return;
     this.synth.cancel();
     this.isPaused = false;
-    this.speakFrom(Math.max(this.currentIndex - 5, 0));
+    this.speakFrom(Math.max(this.currentIndex - this.settings.skipSize, 0));
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -473,7 +472,9 @@ class ControlPanelView extends ItemView {
     const p = this.plugin;
 
     // ── Header ────────────────────────────────────────────────────────────────
-    c.createEl('h4', { text: '🔊 PDF Read Aloud' }).style.marginBottom = '10px';
+    const header = c.createEl('h4');
+    header.style.marginBottom = '10px';
+    header.setText('PDF Read Aloud');
 
     // ── Status badge ──────────────────────────────────────────────────────────
     const statusEl = c.createEl('div');
@@ -481,12 +482,12 @@ class ControlPanelView extends ItemView {
     const pct = p.sentences.length > 0 ? Math.round((p.currentIndex / p.sentences.length) * 100) : 0;
     const pg  = p.sentences[p.currentIndex]?.page;
     const statusText = p.isPlaying
-      ? `▶ Sentence ${p.currentIndex + 1} / ${p.sentences.length}${pg ? ' — p.' + pg : ''}`
+      ? `Playing — sentence ${p.currentIndex + 1} / ${p.sentences.length}${pg ? ' — p.' + pg : ''}`
       : p.isPaused
-        ? `⏸ Paused at ${p.currentIndex + 1} / ${p.sentences.length}`
+        ? `Paused at ${p.currentIndex + 1} / ${p.sentences.length}`
         : p.sentences.length > 0
-          ? `⏹ Stopped (${p.sentences.length} sentences loaded)`
-          : '⏹ Idle';
+          ? `Stopped (${p.sentences.length} sentences loaded)`
+          : 'Idle — open a PDF and press Play';
     statusEl.setText(statusText);
 
     // ── Progress bar ──────────────────────────────────────────────────────────
@@ -496,7 +497,6 @@ class ControlPanelView extends ItemView {
       bar.title = 'Click to jump to position';
       const fill = bar.createEl('div');
       fill.style.cssText = `height:100%;width:${pct}%;background:var(--interactive-accent);transition:width 0.3s;`;
-      // Clicking the progress bar jumps to that position
       bar.addEventListener('click', (e) => {
         const ratio = e.offsetX / bar.offsetWidth;
         const idx = Math.floor(ratio * p.sentences.length);
@@ -518,14 +518,14 @@ class ControlPanelView extends ItemView {
         color:${primary ? 'var(--text-on-accent)' : 'var(--text-normal)'};`;
       b.addEventListener('click', fn);
     };
-    mkBtn('⏮', 'Back 5 sentences',    () => p.skipBack(),  false);
+    mkBtn('⏮', `Back ${p.settings.skipSize} sentences`,    () => p.skipBack(),    false);
     if (!p.isPlaying) {
-      mkBtn('▶', 'Play / Resume',      () => p.play(),      true);
+      mkBtn('▶', 'Play / Resume',                           () => p.play(),        true);
     } else {
-      mkBtn('⏸', 'Pause',             () => p.pause(),     false);
+      mkBtn('⏸', 'Pause',                                  () => p.pause(),       false);
     }
-    mkBtn('⏹', 'Stop',                () => p.stop(),      false);
-    mkBtn('⏭', 'Forward 5 sentences', () => p.skipForward(), false);
+    mkBtn('⏹', 'Stop',                                     () => p.stop(),        false);
+    mkBtn('⏭', `Forward ${p.settings.skipSize} sentences`, () => p.skipForward(), false);
 
     c.createEl('hr').style.cssText = 'border:none;border-top:1px solid var(--background-modifier-border);margin:12px 0;';
 
@@ -533,17 +533,17 @@ class ControlPanelView extends ItemView {
     const actionRow = c.createEl('div');
     actionRow.style.cssText = 'display:flex;gap:6px;margin-bottom:14px;';
 
-    const clickBtn = actionRow.createEl('button', { text: '🖱 Read from click', title: 'Click anywhere in the PDF to start reading from that point' });
+    const clickBtn = actionRow.createEl('button', { text: 'Read from click', title: 'Click anywhere in the PDF to start reading from that point' });
     clickBtn.style.cssText = 'flex:1;padding:7px 4px;border-radius:6px;border:1px solid var(--background-modifier-border);cursor:pointer;font-size:12px;background:var(--background-secondary);color:var(--text-normal);';
     clickBtn.addEventListener('click', () => {
       p.enableClickMode();
       clickBtn.style.background = 'var(--interactive-accent)';
       clickBtn.style.color = 'var(--text-on-accent)';
-      clickBtn.textContent = '⏳ Click in PDF…';
+      clickBtn.setText('Click in PDF…');
       setTimeout(() => this.render(), 5000);
     });
 
-    const selBtn = actionRow.createEl('button', { text: '✂ Read selection', title: 'Read only the text you have highlighted in the PDF' });
+    const selBtn = actionRow.createEl('button', { text: 'Read selection', title: 'Read only the text you have highlighted in the PDF' });
     selBtn.style.cssText = 'flex:1;padding:7px 4px;border-radius:6px;border:1px solid var(--background-modifier-border);cursor:pointer;font-size:12px;background:var(--background-secondary);color:var(--text-normal);';
     selBtn.addEventListener('click', () => p.readSelection());
 
@@ -561,11 +561,27 @@ class ControlPanelView extends ItemView {
       speedLabel.setText(`Speed: ${p.settings.rate.toFixed(1)}×`);
       p.saveSettings();
     });
+    c.appendChild(speedSlider);
+
+    // ── Skip size ─────────────────────────────────────────────────────────────
+    const skipLabel = c.createEl('div');
+    skipLabel.style.cssText = 'font-size:12px;color:var(--text-muted);margin-bottom:4px;';
+    skipLabel.setText(`Skip size: ${p.settings.skipSize} sentences`);
+    const skipSlider = c.createEl('input');
+    Object.assign(skipSlider, { type: 'range', min: '1', max: '20', step: '1', value: String(p.settings.skipSize) });
+    skipSlider.style.cssText = 'width:100%;margin-bottom:12px;accent-color:var(--interactive-accent);';
+    skipSlider.addEventListener('input', e => {
+      p.settings.skipSize = parseInt(e.target.value);
+      skipLabel.setText(`Skip size: ${p.settings.skipSize} sentences`);
+      p.saveSettings();
+    });
+    c.appendChild(skipSlider);
 
     // ── Voice ─────────────────────────────────────────────────────────────────
     const voices = window.speechSynthesis.getVoices();
     if (voices.length > 0) {
-      c.createEl('div', { text: 'Voice' }).style.cssText = 'font-size:12px;color:var(--text-muted);margin-bottom:4px;';
+      const voiceLabel = c.createEl('div', { text: 'Voice' });
+      voiceLabel.style.cssText = 'font-size:12px;color:var(--text-muted);margin-bottom:4px;';
       const sel = c.createEl('select');
       sel.style.cssText = 'width:100%;padding:6px;border-radius:6px;background:var(--background-secondary);color:var(--text-normal);border:1px solid var(--background-modifier-border);font-size:12px;margin-bottom:12px;';
       voices.forEach(v => {
@@ -573,16 +589,29 @@ class ControlPanelView extends ItemView {
         if (v.voiceURI === p.settings.voiceURI) opt.selected = true;
       });
       sel.addEventListener('change', e => { p.settings.voiceURI = e.target.value; p.saveSettings(); });
+    } else {
+      // Voices not yet loaded — show a placeholder; panel will re-render via voiceschanged
+      const voicePending = c.createEl('div');
+      voicePending.style.cssText = 'font-size:12px;color:var(--text-muted);margin-bottom:12px;';
+      voicePending.setText('Voice list loading…');
     }
 
     // ── Tips ──────────────────────────────────────────────────────────────────
     const tips = c.createEl('div');
     tips.style.cssText = 'font-size:11px;color:var(--text-muted);line-height:1.6;margin-top:4px;';
-    tips.innerHTML =
-      '<b>▶ Play</b> — read whole PDF from start<br>' +
-      '<b>🖱 Read from click</b> — then click anywhere in PDF<br>' +
-      '<b>✂ Read selection</b> — highlight text first, then click<br>' +
-      '<b>Right-click</b> in PDF for quick access to both';
+
+    const tipLines = [
+      ['Play', '— reads whole PDF from beginning'],
+      ['Read from click', '— then click anywhere in PDF text'],
+      ['Read selection', '— highlight text first, then click'],
+      ['Right-click', '— quick access inside the PDF viewer'],
+    ];
+    tipLines.forEach(([label, desc]) => {
+      const line = tips.createEl('div');
+      const bold = line.createEl('b');
+      bold.setText(label);
+      line.appendText(' ' + desc);
+    });
   }
 }
 
@@ -593,14 +622,26 @@ class PdfReadAloudSettingTab extends PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl('h2', { text: 'PDF Read Aloud – Settings' });
-    const s = (name, desc, key, min, max, step) =>
+
+    const slider = (name, desc, key, min, max, step) =>
       new Setting(containerEl).setName(name).setDesc(desc)
         .addSlider(sl => sl.setLimits(min, max, step).setValue(this.plugin.settings[key]).setDynamicTooltip()
           .onChange(async v => { this.plugin.settings[key] = v; await this.plugin.saveSettings(); }));
-    s('Speech rate',  'Speed (0.5 slow → 2.0 fast)', 'rate',   0.5, 2.0, 0.1);
-    s('Pitch',        'Voice pitch',                  'pitch',  0.5, 2.0, 0.1);
-    s('Volume',       'Volume level',                 'volume', 0.0, 1.0, 0.1);
+
+    slider('Speech rate',  'Speed: 0.5 (slow) → 2.0 (fast)', 'rate',     0.5, 2.0, 0.1);
+    slider('Pitch',        'Voice pitch',                      'pitch',    0.5, 2.0, 0.1);
+    slider('Volume',       'Volume level',                     'volume',   0.0, 1.0, 0.1);
+    slider('Skip size',    'Sentences to skip forward/back',   'skipSize', 1,   20,  1);
+
+    new Setting(containerEl)
+      .setName('Voice')
+      .setDesc('Text-to-speech voice (uses voices installed on your system)')
+      .addDropdown(drop => {
+        const voices = window.speechSynthesis.getVoices();
+        voices.forEach(v => drop.addOption(v.voiceURI, `${v.name} (${v.lang})`));
+        drop.setValue(this.plugin.settings.voiceURI);
+        drop.onChange(async v => { this.plugin.settings.voiceURI = v; await this.plugin.saveSettings(); });
+      });
   }
 }
 
