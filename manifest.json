@@ -3,8 +3,8 @@
   "name": "PDF Read Aloud",
   "version": "1.0.0",
   "minAppVersion": "1.0.0",
-  "description": "Reads your open PDF documents aloud using text-to-speech. Includes play, pause, stop, skip controls and speed adjustment.",
-  "author": "Custom Plugin",
-  "authorUrl": "",
+  "description": "Reads open PDF files aloud using the Web Speech API. Includes play, pause, stop, skip controls, speed adjustment, voice selection, and click-to-start.",
+  "author": "Gurnoor Rana",
+  "authorUrl": "https://github.com/GurnoorRana",
   "isDesktopOnly": false
 }
