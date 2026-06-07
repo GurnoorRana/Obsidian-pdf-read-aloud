@@ -1,0 +1,10 @@
+{
+  "id": "pdf-read-aloud",
+  "name": "PDF Read Aloud",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "Reads your open PDF documents aloud using text-to-speech. Includes play, pause, stop, skip controls and speed adjustment.",
+  "author": "Custom Plugin",
+  "authorUrl": "",
+  "isDesktopOnly": false
+}
