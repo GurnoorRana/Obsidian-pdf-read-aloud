@@ -1,9 +1,9 @@
 {
   "id": "pdf-read-aloud",
   "name": "PDF Read Aloud",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "minAppVersion": "1.4.0",
-  "description": "Reads open PDF files aloud using the Web Speech API. Includes play, pause, stop, skip controls, speed adjustment, voice selection, and click-to-start.",
+  "description": "Reads open PDF files aloud using the Web Speech API. Includes play, pause, stop, skip controls, speed adjustment, voice selection, click-to-start, and follow-along highlighting of the sentence and word being spoken.",
   "author": "Gurnoor Rana",
   "authorUrl": "https://github.com/GurnoorRana",
   "fundingUrl": "https://paypal.me/AlphaV",

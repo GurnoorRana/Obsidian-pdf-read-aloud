@@ -6,6 +6,7 @@
   - Read selection only (select text → "Read selection")
   - Speed, pitch, volume, voice controls
   - Voice dropdown reloads on voiceschanged event
+  - Follow-along highlighting: colors the sentence + current word being spoken
   - No innerHTML usage (XSS-safe)
 */
 
@@ -19,7 +20,16 @@ const DEFAULT_SETTINGS = {
   volume: 1.0,
   voiceURI: '',
   skipSize: 5,
+  highlightEnabled: true,
+  autoScroll: true,
+  sentenceColor: '#ffd000',
+  sentenceOpacity: 0.5,
+  wordColor: '#ff8200',
+  wordOpacity: 0.8,
 };
+
+const HL_SENTENCE = 'pdf-read-aloud-sentence';
+const HL_WORD = 'pdf-read-aloud-word';
 
 class PdfReadAloudPlugin extends Plugin {
   async onload() {
@@ -36,6 +46,10 @@ class PdfReadAloudPlugin extends Plugin {
     this.mode = 'idle';
     this._pdfDoc = null;
     this._clickHandler = null;
+    this._hlMatch = null;          // current sentence match in the text layer (for word highlighting)
+    this._fallbackEls = { sentence: [], word: [] };
+    this._styleEl = null;
+    this._updateHighlightStyles();
 
     // Reload voice list whenever the browser finishes populating it
     this._voicesChangedHandler = () => this.refreshPanel();
@@ -64,6 +78,11 @@ class PdfReadAloudPlugin extends Plugin {
 
   onunload() {
     this.stop();
+    this._clearHighlights();
+    if (this._styleEl) {
+      this._styleEl.remove();
+      this._styleEl = null;
+    }
     this._detachClickHandler();
     if (this._voicesChangedHandler) {
       window.speechSynthesis.removeEventListener('voiceschanged', this._voicesChangedHandler);
@@ -328,6 +347,213 @@ class PdfReadAloudPlugin extends Plugin {
     this._startPlayback(startIdx);
   }
 
+  // ── Highlighting (follow along) ───────────────────────────────────────────────
+  //
+  // Highlights the sentence being spoken (and the current word within it) in the
+  // PDF's text layer. Uses the CSS Custom Highlight API so the pdf.js DOM is never
+  // mutated; falls back to a class on the text-layer spans on older engines.
+
+  _hexToRgba(hex, alpha) {
+    const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+    if (!m) return `rgba(255, 208, 0, ${alpha})`;
+    const n = parseInt(m[1], 16);
+    return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
+  }
+
+  // (Re)build the style element carrying the user-chosen highlight colors.
+  // ::highlight() rules can't reliably read CSS variables, so we write the
+  // resolved rgba values directly and let this element override styles.css.
+  _updateHighlightStyles() {
+    const s = this.settings;
+    const sentColor = this._hexToRgba(s.sentenceColor, s.sentenceOpacity);
+    const wordColor = this._hexToRgba(s.wordColor, s.wordOpacity);
+    if (!this._styleEl) {
+      this._styleEl = document.head.createEl('style');
+      this._styleEl.setAttribute('data-pdf-read-aloud', 'highlight-colors');
+    }
+    this._styleEl.textContent = `
+      ::highlight(${HL_SENTENCE}) { background-color: ${sentColor}; }
+      ::highlight(${HL_WORD})     { background-color: ${wordColor}; }
+      .pra-hl-sentence { background-color: ${sentColor} !important; }
+      .pra-hl-word     { background-color: ${wordColor} !important; }
+    `;
+  }
+
+  _findTextLayerForPage(pageNum) {
+    const view = this._getPdfView();
+    const root = view?.containerEl || document;
+    const pageEl = root.querySelector(`.page[data-page-number="${pageNum}"]`);
+    const tl = pageEl?.querySelector('.textLayer');
+    if (tl && tl.textContent && tl.textContent.trim().length > 0) return tl;
+    return null;
+  }
+
+  // Walk every text node in the text layer and build a whitespace-free, lowercase
+  // string plus a per-character map back to (node, offset). Whitespace-free
+  // matching is what makes extracted sentences line up with the rendered spans,
+  // since pdf.js splits/joins runs differently than getTextContent().
+  _buildDomMap(textLayerEl) {
+    const domMap = [];
+    let normStr = '';
+    const walker = document.createTreeWalker(textLayerEl, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      const text = node.nodeValue;
+      for (let i = 0; i < text.length; i++) {
+        if (/\s/.test(text[i])) continue;
+        normStr += text[i].toLowerCase();
+        domMap.push({ node, offset: i });
+      }
+    }
+    return { normStr, domMap };
+  }
+
+  _rangeFromDomMap(domMap, startIdx, endIdx) {
+    if (startIdx < 0 || startIdx >= domMap.length) return null;
+    endIdx = Math.min(endIdx, domMap.length);
+    if (endIdx <= startIdx) return null;
+    const range = document.createRange();
+    const first = domMap[startIdx];
+    const last = domMap[endIdx - 1];
+    try {
+      range.setStart(first.node, first.offset);
+      range.setEnd(last.node, last.offset + 1);
+    } catch (_) {
+      return null;
+    }
+    return range;
+  }
+
+  _setHighlight(kind, range, domMap, startIdx, endIdx) {
+    const name = kind === 'sentence' ? HL_SENTENCE : HL_WORD;
+    if (typeof Highlight !== 'undefined' && CSS.highlights) {
+      const hl = new Highlight(range);
+      hl.priority = kind === 'word' ? 2 : 1; // word paints on top of sentence
+      CSS.highlights.set(name, hl);
+    } else {
+      this._clearFallback(kind);
+      const els = new Set();
+      for (let i = startIdx; i < endIdx; i++) {
+        const el = domMap[i].node.parentElement;
+        if (el) els.add(el);
+      }
+      const cls = kind === 'sentence' ? 'pra-hl-sentence' : 'pra-hl-word';
+      els.forEach(el => el.classList.add(cls));
+      this._fallbackEls[kind] = [...els];
+    }
+  }
+
+  _clearFallback(kind) {
+    const cls = kind === 'sentence' ? 'pra-hl-sentence' : 'pra-hl-word';
+    (this._fallbackEls[kind] || []).forEach(el => el.classList.remove(cls));
+    this._fallbackEls[kind] = [];
+  }
+
+  _clearWordHighlight() {
+    if (typeof Highlight !== 'undefined' && CSS.highlights) CSS.highlights.delete(HL_WORD);
+    this._clearFallback('word');
+  }
+
+  _clearHighlights() {
+    if (typeof Highlight !== 'undefined' && CSS.highlights) {
+      CSS.highlights.delete(HL_SENTENCE);
+      CSS.highlights.delete(HL_WORD);
+    }
+    this._clearFallback('sentence');
+    this._clearFallback('word');
+    this._hlMatch = null;
+  }
+
+  _highlightSentence(index, isRetry) {
+    this._clearWordHighlight();
+    this._hlMatch = null;
+
+    const sentence = this.sentences[index];
+    // page 0 = "read selection directly" (text not tied to a PDF location)
+    if (!sentence || !sentence.page) { this._clearHighlights(); return; }
+
+    const textLayer = this._findTextLayerForPage(sentence.page);
+    if (!textLayer) {
+      this._clearHighlights();
+      // Page not rendered yet (pdf.js virtualizes pages) — scroll to it and retry once.
+      if (!isRetry && this.settings.autoScroll) {
+        this._scrollToPage(sentence.page);
+        setTimeout(() => {
+          if (this.currentIndex === index && (this.isPlaying || this.isPaused)) {
+            this._highlightSentence(index, true);
+          }
+        }, 500);
+      }
+      return;
+    }
+
+    const { normStr, domMap } = this._buildDomMap(textLayer);
+    const target = sentence.text.toLowerCase().replace(/\s+/g, '');
+    let start = normStr.indexOf(target);
+    let len = target.length;
+    if (start === -1 && target.length > 40) {
+      // Partial match on the leading chunk (handles hyphenation/ligature quirks)
+      start = normStr.indexOf(target.slice(0, 40));
+      if (start !== -1) len = Math.min(target.length, normStr.length - start);
+    }
+    if (start === -1 || len === 0) { this._clearHighlights(); return; }
+
+    this._hlMatch = { start, len, domMap, sentenceText: sentence.text };
+
+    const range = this._rangeFromDomMap(domMap, start, start + len);
+    if (!range) { this._clearHighlights(); return; }
+    this._setHighlight('sentence', range, domMap, start, start + len);
+    if (this.settings.autoScroll) this._scrollRangeIntoView(range);
+  }
+
+  // charIndex/charLength come from the utterance's word-boundary event and are
+  // offsets into the sentence text itself.
+  _highlightWord(charIndex, charLength) {
+    const m = this._hlMatch;
+    if (!m || charIndex == null || charIndex >= m.sentenceText.length) return;
+
+    const text = m.sentenceText;
+    let end = charIndex + (charLength || 0);
+    if (!charLength) {
+      const rest = text.slice(charIndex).match(/^\s*\S+/);
+      end = charIndex + (rest ? rest[0].length : 0);
+    }
+
+    // Convert sentence offsets to whitespace-free offsets to index the dom map.
+    const nsBefore = text.slice(0, charIndex).replace(/\s+/g, '').length;
+    const nsLen = text.slice(charIndex, end).replace(/\s+/g, '').length;
+    if (nsLen === 0) return;
+
+    const s = m.start + nsBefore;
+    const e = Math.min(s + nsLen, m.start + m.len, m.domMap.length);
+    const range = this._rangeFromDomMap(m.domMap, s, e);
+    if (range) this._setHighlight('word', range, m.domMap, s, e);
+  }
+
+  _scrollToPage(pageNum) {
+    const view = this._getPdfView();
+    if (!view) return;
+    const pdfViewer =
+      view?.viewer?.pdfViewer ||
+      view?.pdfViewer ||
+      view?.viewer?.child?.pdfViewer ||
+      this._deepFind(view, 'pdfViewer');
+    try {
+      if (pdfViewer && typeof pdfViewer.currentPageNumber === 'number') {
+        pdfViewer.currentPageNumber = pageNum;
+      }
+    } catch (_) { /* viewer internals unavailable — skip scrolling */ }
+  }
+
+  _scrollRangeIntoView(range) {
+    const el = range.startContainer.parentElement;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    if (rect.top < 80 || rect.bottom > window.innerHeight - 80) {
+      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  }
+
   // ── Playback engine ───────────────────────────────────────────────────────────
 
   async play() {
@@ -361,6 +587,7 @@ class PdfReadAloudPlugin extends Plugin {
     if (index > stopAt || index >= this.sentences.length) {
       this.isPlaying = false;
       this.isPaused = false;
+      this._clearHighlights();
       this.updateStatusBar('Finished');
       this.refreshPanel();
       new Notice('PDF Read Aloud: Done ✓');
@@ -368,6 +595,9 @@ class PdfReadAloudPlugin extends Plugin {
     }
 
     this.currentIndex = index;
+    if (this.settings.highlightEnabled) {
+      this._highlightSentence(index);
+    }
     const sentence = this.sentences[index].text;
     const utt = new SpeechSynthesisUtterance(sentence);
     utt.rate   = this.settings.rate;
@@ -379,12 +609,19 @@ class PdfReadAloudPlugin extends Plugin {
       if (voice) utt.voice = voice;
     }
 
+    utt.onboundary = (e) => {
+      // Word-boundary events don't fire with every voice — sentence highlight still works.
+      if (e.name === 'word' && this.settings.highlightEnabled && this.isPlaying) {
+        this._highlightWord(e.charIndex, e.charLength);
+      }
+    };
     utt.onend = () => {
       if (this.isPlaying && !this.isPaused) this.speakFrom(index + 1);
     };
     utt.onerror = (e) => {
       if (e.error !== 'interrupted' && e.error !== 'canceled') {
         this.isPlaying = false;
+        this._clearHighlights();
         this.updateStatusBar('Error');
         this.refreshPanel();
       }
@@ -412,6 +649,7 @@ class PdfReadAloudPlugin extends Plugin {
     this.isPaused = false;
     this.currentIndex = 0;
     this.endIndex = -1;
+    this._clearHighlights();
     this.updateStatusBar('Idle');
     this.refreshPanel();
   }
@@ -549,6 +787,57 @@ class ControlPanelView extends ItemView {
 
     c.createEl('hr').style.cssText = 'border:none;border-top:1px solid var(--background-modifier-border);margin:12px 0;';
 
+    // ── Highlight controls ────────────────────────────────────────────────────
+    const hlRow = c.createEl('div');
+    hlRow.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:10px;';
+
+    const hlCheck = hlRow.createEl('input');
+    Object.assign(hlCheck, { type: 'checkbox', checked: p.settings.highlightEnabled, id: 'pra-hl-toggle' });
+    hlCheck.style.cssText = 'cursor:pointer;accent-color:var(--interactive-accent);';
+    const hlLabel = hlRow.createEl('label', { text: 'Highlight while reading' });
+    hlLabel.htmlFor = 'pra-hl-toggle';
+    hlLabel.style.cssText = 'font-size:12px;color:var(--text-normal);cursor:pointer;flex:1;';
+    hlCheck.addEventListener('change', () => {
+      p.settings.highlightEnabled = hlCheck.checked;
+      if (!hlCheck.checked) p._clearHighlights();
+      p.saveSettings();
+      this.render();
+    });
+
+    if (p.settings.highlightEnabled) {
+      const mkColorRow = (label, colorKey, opacityKey) => {
+        const row = c.createEl('div');
+        row.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:8px;';
+
+        const lbl = row.createEl('span', { text: label });
+        lbl.style.cssText = 'font-size:12px;color:var(--text-muted);width:64px;flex-shrink:0;';
+
+        const picker = row.createEl('input');
+        Object.assign(picker, { type: 'color', value: p.settings[colorKey] });
+        picker.title = `${label} highlight color`;
+        picker.style.cssText = 'width:32px;height:24px;padding:0;border:1px solid var(--background-modifier-border);border-radius:4px;cursor:pointer;background:transparent;';
+        picker.addEventListener('input', () => {
+          p.settings[colorKey] = picker.value;
+          p._updateHighlightStyles();
+          p.saveSettings();
+        });
+
+        const opacity = row.createEl('input');
+        Object.assign(opacity, { type: 'range', min: '0.1', max: '1', step: '0.05', value: String(p.settings[opacityKey]) });
+        opacity.title = `${label} highlight opacity`;
+        opacity.style.cssText = 'flex:1;accent-color:var(--interactive-accent);';
+        opacity.addEventListener('input', () => {
+          p.settings[opacityKey] = parseFloat(opacity.value);
+          p._updateHighlightStyles();
+          p.saveSettings();
+        });
+      };
+      mkColorRow('Sentence', 'sentenceColor', 'sentenceOpacity');
+      mkColorRow('Word',     'wordColor',     'wordOpacity');
+    }
+
+    c.createEl('hr').style.cssText = 'border:none;border-top:1px solid var(--background-modifier-border);margin:12px 0;';
+
     // ── Speed ─────────────────────────────────────────────────────────────────
     const speedLabel = c.createEl('div');
     speedLabel.style.cssText = 'font-size:12px;color:var(--text-muted);margin-bottom:4px;';
@@ -634,6 +923,60 @@ class PdfReadAloudSettingTab extends PluginSettingTab {
     slider('Skip size',    'Sentences to skip forward/back',   'skipSize', 1,   20,  1);
 
     new Setting(containerEl)
+      .setName('Highlight while reading')
+      .setDesc('Color the sentence (and current word, if your voice supports it) being read aloud in the PDF')
+      .addToggle(t => t.setValue(this.plugin.settings.highlightEnabled)
+        .onChange(async v => {
+          this.plugin.settings.highlightEnabled = v;
+          if (!v) this.plugin._clearHighlights();
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName('Auto-scroll to sentence')
+      .setDesc('Keep the highlighted sentence visible by scrolling the PDF as reading progresses')
+      .addToggle(t => t.setValue(this.plugin.settings.autoScroll)
+        .onChange(async v => { this.plugin.settings.autoScroll = v; await this.plugin.saveSettings(); }));
+
+    const colorSetting = (name, desc, colorKey, opacityKey) => {
+      new Setting(containerEl)
+        .setName(name)
+        .setDesc(desc)
+        .addColorPicker(cp => cp.setValue(this.plugin.settings[colorKey])
+          .onChange(async v => {
+            this.plugin.settings[colorKey] = v;
+            this.plugin._updateHighlightStyles();
+            await this.plugin.saveSettings();
+          }))
+        .addSlider(sl => sl.setLimits(0.1, 1.0, 0.05)
+          .setValue(this.plugin.settings[opacityKey])
+          .setDynamicTooltip()
+          .onChange(async v => {
+            this.plugin.settings[opacityKey] = v;
+            this.plugin._updateHighlightStyles();
+            await this.plugin.saveSettings();
+          }));
+    };
+
+    colorSetting('Sentence highlight color', 'Color and opacity for the sentence being read — pick something that stands out against your PDF background', 'sentenceColor', 'sentenceOpacity');
+    colorSetting('Word highlight color', 'Color and opacity for the word currently being spoken', 'wordColor', 'wordOpacity');
+
+    new Setting(containerEl)
+      .setName('Reset highlight colors')
+      .setDesc('Restore the default yellow sentence / orange word highlight')
+      .addButton(b => b.setButtonText('Reset')
+        .onClick(async () => {
+          const p = this.plugin;
+          p.settings.sentenceColor   = DEFAULT_SETTINGS.sentenceColor;
+          p.settings.sentenceOpacity = DEFAULT_SETTINGS.sentenceOpacity;
+          p.settings.wordColor       = DEFAULT_SETTINGS.wordColor;
+          p.settings.wordOpacity     = DEFAULT_SETTINGS.wordOpacity;
+          p._updateHighlightStyles();
+          await p.saveSettings();
+          this.display();
+        }));
+
+    new Setting(containerEl)
       .setName('Voice')
       .setDesc('Text-to-speech voice (uses voices installed on your system)')
       .addDropdown(drop => {
@@ -646,3 +989,5 @@ class PdfReadAloudSettingTab extends PluginSettingTab {
 }
 
 module.exports = PdfReadAloudPlugin;
+
+/* nosourcemap */

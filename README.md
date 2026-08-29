@@ -4,6 +4,8 @@ Reads your open PDF files aloud using your device's built-in text-to-speech. No 
 
 ## Features
 
+- **Follow-along highlighting** — the sentence being read and the word currently being spoken are highlighted right in the PDF, with fully customizable colors and opacity (so it works on any PDF background)
+- **Auto-scroll** — the PDF scrolls automatically to keep the highlighted sentence in view
 - **Play / Pause / Stop** controls
 - **Skip forward / back** by a configurable number of sentences (default 5, adjustable up to 20)
 - **Read from click** — enable click mode, then click anywhere in the PDF text layer to start reading from that point
@@ -29,7 +31,7 @@ Reads your open PDF files aloud using your device's built-in text-to-speech. No 
 1. Go to your Obsidian vault folder
 2. Navigate to `.obsidian/plugins/`
 3. Create a folder named `pdf-read-aloud`
-4. Download `main.js` and `manifest.json` from the [latest release](https://github.com/GurnoorRana/Obsidian-pdf-read-aloud/releases/latest) and copy them into that folder
+4. Download `main.js`, `manifest.json`, and `styles.css` from the [latest release](https://github.com/GurnoorRana/Obsidian-pdf-read-aloud/releases/latest) and copy them into that folder
 5. In Obsidian: **Settings → Community Plugins** → find **PDF Read Aloud** and enable it
 
 > **macOS tip:** Press **Cmd+Shift+.** in Finder to show hidden folders like `.obsidian`.  
@@ -65,6 +67,12 @@ All settings are available under **Settings → PDF Read Aloud**:
 | Volume | Volume level | 1.0 |
 | Skip size | Number of sentences to skip forward/back | 5 |
 | Voice | System TTS voice to use | System default |
+| Highlight while reading | Color the sentence and word being spoken in the PDF | On |
+| Auto-scroll to sentence | Keep the highlighted sentence visible while reading | On |
+| Sentence highlight color | Color + opacity of the sentence highlight | Yellow, 30% |
+| Word highlight color | Color + opacity of the current-word highlight | Orange, 55% |
+
+Highlight colors can also be changed directly from the control panel.
 
 ## Notes
 
@@ -73,6 +81,12 @@ All settings are available under **Settings → PDF Read Aloud**:
 - Voice availability depends on your operating system and installed language packs.
 
 ## Changelog
+
+### 1.2.0
+- **Follow-along highlighting**: the sentence being read is highlighted in the PDF, and the current word gets a stronger highlight (word-level tracking depends on the selected voice supporting word-boundary events)
+- Auto-scroll keeps the highlighted sentence in view, including jumping to not-yet-rendered pages
+- Customizable highlight colors and opacity, editable from both the settings tab and the control panel
+- Highlighting uses the CSS Custom Highlight API, so the PDF text layer is never modified
 
 ### 1.1.0
 - Fixed voice dropdown not populating when panel opens before voices are loaded

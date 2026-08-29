@@ -1,0 +1,8 @@
+/* PDF Read Aloud — follow-along highlighting.
+   Highlight colors are user-configurable and injected at runtime by the plugin
+   (see _updateHighlightStyles in main.js); only structural styles live here. */
+
+.pra-hl-sentence,
+.pra-hl-word {
+  border-radius: 2px;
+}
