@@ -22,14 +22,34 @@ const DEFAULT_SETTINGS = {
   skipSize: 5,
   highlightEnabled: true,
   autoScroll: true,
+  skipHeadersFooters: true,
+  columnDetection: true,
+  rememberPosition: true,
+  positions: {},
   sentenceColor: '#ffd000',
-  sentenceOpacity: 0.5,
+  sentenceOpacity: 0.3,
   wordColor: '#ff8200',
-  wordOpacity: 0.8,
+  wordOpacity: 0.55,
 };
 
 const HL_SENTENCE = 'pdf-read-aloud-sentence';
 const HL_WORD = 'pdf-read-aloud-word';
+
+// Characters ignored when matching spoken text against the rendered text layer:
+// whitespace plus hyphens/soft hyphens, so words rejoined across line breaks
+// ("adven-" + "ture" → "adventure") still line up with the DOM's hyphenated form.
+const HL_IGNORED = /[\s­‐‑-]/;
+const HL_IGNORED_G = /[\s­‐‑-]+/g;
+
+// Words a period may follow without ending the sentence.
+const ABBREVIATIONS = new Set([
+  'mr', 'mrs', 'ms', 'dr', 'prof', 'sr', 'jr', 'st', 'msgr', 'rev', 'hon',
+  'vs', 'etc', 'inc', 'ltd', 'co', 'corp', 'dept', 'univ', 'assn', 'bros',
+  'fig', 'figs', 'no', 'nos', 'vol', 'vols', 'ch', 'chs', 'sec', 'secs',
+  'p', 'pp', 'pg', 'para', 'ed', 'eds', 'al', 'cf', 'ca', 'approx', 'est',
+  'gen', 'col', 'lt', 'sgt', 'capt', 'maj', 'cmdr', 'adm', 'gov', 'sen', 'rep',
+  'mt', 'ft', 'rd', 'ave', 'blvd', 'hwy', 'min', 'max', 'misc', 'dept',
+]);
 
 class PdfReadAloudPlugin extends Plugin {
   async onload() {
@@ -48,6 +68,8 @@ class PdfReadAloudPlugin extends Plugin {
     this._clickHandler = null;
     this._hlMatch = null;          // current sentence match in the text layer (for word highlighting)
     this._fallbackEls = { sentence: [], word: [] };
+    this._activeFilePath = null;   // vault path of the PDF/note being read
+    this._extractCache = null;     // { key, sentences } — avoids re-extracting unchanged PDFs
     this._styleEl = null;
     this._updateHighlightStyles();
 
@@ -72,6 +94,18 @@ class PdfReadAloudPlugin extends Plugin {
 
     // Listen for right-click in PDF viewer to inject context menu items
     this.registerDomEvent(document, 'contextmenu', (evt) => this._onContextMenu(evt), true);
+
+    // Stop playback (saving the resume position) when the file being read is closed
+    this.registerEvent(this.app.workspace.on('layout-change', () => {
+      if (!(this.isPlaying || this.isPaused) || !this._activeFilePath) return;
+      const stillOpen = this.app.workspace.getLeavesOfType('pdf')
+        .concat(this.app.workspace.getLeavesOfType('markdown'))
+        .some(l => l.view?.file?.path === this._activeFilePath);
+      if (!stillOpen) {
+        this.stop();
+        new Notice('PDF Read Aloud: stopped — the file being read was closed.');
+      }
+    }));
 
     this.addSettingTab(new PdfReadAloudSettingTab(this.app, this));
   }
@@ -128,6 +162,63 @@ class PdfReadAloudPlugin extends Plugin {
     return null;
   }
 
+  // The view Play should read: the active PDF or Markdown note, else any open PDF.
+  _getActiveReadableView() {
+    const active = this.app.workspace.activeLeaf?.view;
+    const type = active?.getViewType?.();
+    if (type === 'pdf' || type === 'markdown') return active;
+    return this._getPdfView();
+  }
+
+  // ── Markdown notes ─────────────────────────────────────────────────────────────
+
+  _stripMarkdown(md) {
+    return md
+      .replace(/^---\n[\s\S]*?\n---\n?/, '')                    // frontmatter
+      .replace(/```[\s\S]*?```/g, '')                            // fenced code blocks
+      .replace(/`([^`]+)`/g, '$1')                               // inline code
+      .replace(/!\[\[[^\]]*\]\]/g, '')                           // embeds/images
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, '')                      // markdown images
+      .replace(/\[\[([^\]|]*)\|([^\]]*)\]\]/g, '$2')             // [[page|alias]] → alias
+      .replace(/\[\[([^\]]*)\]\]/g, '$1')                        // [[page]] → page
+      .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')                   // [text](url) → text
+      .replace(/^#{1,6}\s+/gm, '')                               // heading markers
+      .replace(/^>\s?/gm, '')                                    // blockquote markers
+      .replace(/^\s*[-*+]\s+/gm, '')                             // bullet markers
+      .replace(/^\s*\d+\.\s+/gm, '')                             // numbered-list markers
+      .replace(/^\s*[|\-\s:]+\s*$/gm, '')                        // table separator rows
+      .replace(/\|/g, ' ')                                       // table pipes → spaces
+      .replace(/(\*\*|__|~~|==)/g, '')                           // bold/strike/highlight
+      .replace(/(^|\s)[*_]([^*_]+)[*_](?=[\s.,;:!?)]|$)/gm, '$1$2') // italics
+      .replace(/<[^>]+>/g, '');                                  // html tags
+  }
+
+  async _extractMarkdown(view) {
+    let raw = view.editor?.getValue?.() ?? '';
+    if (!raw && view.file) raw = await this.app.vault.cachedRead(view.file);
+
+    const sentences = [];
+    for (const para of this._stripMarkdown(raw).split(/\n{2,}/)) {
+      const t = para.replace(/\s+/g, ' ').trim();
+      if (!t) continue;
+      sentences.push(...this._splitSentences(t)
+        .filter(s => s.length > 2)
+        .map(s => ({ text: s, page: 0 })));
+    }
+    if (sentences.length === 0) {
+      new Notice('This note has no readable text.');
+      return null;
+    }
+    return sentences;
+  }
+
+  // Extract whatever is currently readable: the active note, or the open PDF.
+  async _extractForReading() {
+    const view = this._getActiveReadableView();
+    if (view?.getViewType?.() === 'markdown') return this._extractMarkdown(view);
+    return this._extractAllPages();
+  }
+
   async _getPdfDoc() {
     const view = this._getPdfView();
     if (!view) return null;
@@ -148,8 +239,216 @@ class PdfReadAloudPlugin extends Plugin {
            null;
   }
 
+  // ── Sentence splitting ─────────────────────────────────────────────────────────
+  //
+  // Abbreviation/number-aware splitter. A [.!?] only ends a sentence when the word
+  // before it isn't a known abbreviation or initial, and what follows looks like
+  // the start of a new sentence (capital, digit, or opening quote/bracket).
+
+  _splitSentences(text) {
+    if (!text) return [];
+    const parts = [];
+    let start = 0;
+
+    const re = /[.!?]+["'’”)\]]*\s+/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const boundaryEnd = m.index + m[0].length;
+
+      // What comes next must look like a sentence start.
+      const next = text[boundaryEnd];
+      if (next && !/[A-Z0-9"'‘“([••\-–—]/.test(next)) continue;
+
+      // Word immediately before the punctuation.
+      const before = text.slice(Math.max(start, m.index - 12), m.index);
+      const wordMatch = /(\S+)$/.exec(before);
+      const word = wordMatch ? wordMatch[1].toLowerCase().replace(/^[("'‘“[]+/, '') : '';
+
+      if (text[m.index] === '.') {
+        // Single-letter initials ("J. R. R. Tolkien") and lone digits ("No. 5.")
+        if (/^[a-z]$/.test(word)) continue;
+        if (ABBREVIATIONS.has(word)) continue;
+        // "e.g." / "i.e." style dotted abbreviations
+        if (/^([a-z]\.)+[a-z]?$/.test(word)) continue;
+      }
+
+      const sentence = text.slice(start, boundaryEnd).trim();
+      if (sentence) parts.push(sentence);
+      start = boundaryEnd;
+    }
+
+    const tail = text.slice(start).trim();
+    if (tail) parts.push(tail);
+    return parts;
+  }
+
+  // Group a page's text items into visual lines in reading order, using their PDF
+  // coordinates. transform[4]/[5] are the item's x/y; PDF y grows upward.
+  _groupIntoLines(items) {
+    const placed = items
+      .filter(it => it.str && it.str.trim())
+      .map(it => ({
+        x: it.transform[4],
+        y: it.transform[5],
+        h: it.height || 10,
+        w: it.width || 0,
+        str: it.str,
+      }));
+    if (placed.length === 0) return [];
+
+    const segments = this.settings.columnDetection ? this._orderColumns(placed) : [placed];
+    const lines = [];
+    for (const seg of segments) lines.push(...this._linesFrom(seg));
+    return lines;
+  }
+
+  _linesFrom(placed) {
+    placed.sort((a, b) => (b.y - a.y) || (a.x - b.x));
+    const lines = [];
+    for (const it of placed) {
+      const last = lines[lines.length - 1];
+      if (last && Math.abs(last.y - it.y) < Math.max(2, it.h * 0.5)) {
+        last.parts.push(it);
+      } else {
+        lines.push({ y: it.y, parts: [it] });
+      }
+    }
+    return lines
+      .map(l => {
+        l.parts.sort((a, b) => a.x - b.x);
+        return {
+          y: l.y,
+          x: l.parts[0].x,
+          text: l.parts.map(p => p.str).join(' ').replace(/\s+/g, ' ').trim(),
+        };
+      })
+      .filter(l => l.text);
+  }
+
+  // Detect a two-column layout and return item groups in reading order.
+  // A gutter is a vertical strip in the middle of the page that ≥25% of items
+  // sit entirely left of, ≥25% entirely right of, and ≤10% cross. Items that
+  // cross it (titles, section headers) act as band separators: within each
+  // band the left column is read before the right.
+  _orderColumns(placed) {
+    if (placed.length < 20) return [placed];
+    let minX = Infinity, maxX = -Infinity;
+    for (const it of placed) {
+      minX = Math.min(minX, it.x);
+      maxX = Math.max(maxX, it.x + it.w);
+    }
+    const width = maxX - minX;
+    if (width < 100) return [placed];
+
+    let gutter = null;
+    let bestCross = Infinity;
+    for (let frac = 0.35; frac <= 0.65; frac += 0.02) {
+      const g = minX + width * frac;
+      let nLeft = 0, nRight = 0, nCross = 0;
+      for (const it of placed) {
+        if (it.x + it.w <= g) nLeft++;
+        else if (it.x >= g) nRight++;
+        else nCross++;
+      }
+      const total = placed.length;
+      if (nLeft >= total * 0.25 && nRight >= total * 0.25 && nCross <= total * 0.1 && nCross < bestCross) {
+        bestCross = nCross;
+        gutter = g;
+      }
+    }
+    if (gutter === null) return [placed];
+
+    const left = [], right = [], full = [];
+    for (const it of placed) {
+      if (it.x + it.w <= gutter) left.push(it);
+      else if (it.x >= gutter) right.push(it);
+      else full.push(it);
+    }
+
+    // Cluster full-width items into separator lines, top to bottom.
+    full.sort((a, b) => b.y - a.y);
+    const seps = [];
+    for (const it of full) {
+      const last = seps[seps.length - 1];
+      if (last && Math.abs(last.y - it.y) < Math.max(2, it.h)) last.items.push(it);
+      else seps.push({ y: it.y, items: [it] });
+    }
+
+    const segments = [];
+    let top = Infinity;
+    for (const sep of seps) {
+      const inBand = i => i.y < top && i.y >= sep.y;
+      const l = left.filter(inBand), r = right.filter(inBand);
+      if (l.length) segments.push(l);
+      if (r.length) segments.push(r);
+      segments.push(sep.items);
+      top = sep.y;
+    }
+    const l = left.filter(i => i.y < top), r = right.filter(i => i.y < top);
+    if (l.length) segments.push(l);
+    if (r.length) segments.push(r);
+    return segments;
+  }
+
+  // Drop repeated headers/footers and standalone page numbers. A top/bottom line
+  // is a header/footer when its digit-normalized text recurs on ≥30% of pages
+  // (so "Chapter 3 — 17" on every page matches "Chapter 3 — 18").
+  _stripHeadersFooters(pages) {
+    if (pages.length < 3) return;
+    const norm = t => t.toLowerCase().replace(/\d+/g, '#').replace(/\s+/g, ' ').trim();
+    const isPageNum = t => /^(page\s*)?[0-9ivxlcdm]+(\s*(of|\/|–|-)\s*[0-9ivxlcdm]+)?$/i.test(t.trim());
+
+    const freq = new Map();
+    for (const pg of pages) {
+      const edge = new Set([...pg.lines.slice(0, 2), ...pg.lines.slice(-2)]);
+      for (const l of edge) {
+        if (l.text.length > 80) continue; // long lines are prose, not headers
+        const n = norm(l.text);
+        freq.set(n, (freq.get(n) || 0) + 1);
+      }
+    }
+
+    const threshold = Math.max(3, Math.ceil(pages.length * 0.3));
+    for (const pg of pages) {
+      const lastIdx = pg.lines.length - 1;
+      pg.lines = pg.lines.filter((l, idx) => {
+        const isEdge = idx < 2 || idx > lastIdx - 2;
+        if (!isEdge) return true;
+        if (isPageNum(l.text)) return false;
+        if (l.text.length <= 80 && (freq.get(norm(l.text)) || 0) >= threshold) return false;
+        return true;
+      });
+    }
+  }
+
+  // Rejoin words hyphenated across line breaks: "adven-" + "ture" → "adventure".
+  // Only merges when the next line starts lowercase, so list dashes and ranges
+  // ("pages 10-" / "20 of the book") are left alone unless they read as one word.
+  _joinLines(lines) {
+    let out = '';
+    for (const l of lines) {
+      const t = l.text.replace(/­/g, '-'); // soft hyphens → visible hyphens
+      if (/[A-Za-z][-‐‑]$/.test(out) && /^[a-z]/.test(t)) {
+        out = out.slice(0, -1) + t;
+      } else {
+        out += (out ? ' ' : '') + t;
+      }
+    }
+    return out;
+  }
+
   // Extract text from ALL pages, returning array of {pageNum, sentences[]}
   async _extractAllPages() {
+    const file = this._getPdfView()?.file;
+    // Key includes mtime and the settings that shape extraction, so editing the
+    // file or flipping those toggles naturally invalidates the cache.
+    const cacheKey = file
+      ? `${file.path}|${file.stat?.mtime}|${this.settings.skipHeadersFooters}|${this.settings.columnDetection}`
+      : null;
+    if (cacheKey && this._extractCache?.key === cacheKey) {
+      return this._extractCache.sentences;
+    }
+
     const pdfDoc = await this._getPdfDoc();
     if (!pdfDoc) {
       new Notice('Could not access PDF. Click on the PDF tab and wait for it to load fully.');
@@ -158,28 +457,42 @@ class PdfReadAloudPlugin extends Plugin {
 
     new Notice('Extracting PDF text…');
     const numPages = pdfDoc.numPages;
-    const allSentences = [];
+    const pages = [];
 
     for (let i = 1; i <= numPages; i++) {
       try {
         const page = await pdfDoc.getPage(i);
         const content = await page.getTextContent();
-        const pageText = content.items.map(item => item.str).join(' ').replace(/\s+/g, ' ').trim();
-        if (!pageText) continue;
-        const sentences = pageText
-          .split(/(?<=[.!?])\s+/)
-          .filter(s => s.trim().length > 2)
-          .map(s => ({ text: s.trim(), page: i }));
-        allSentences.push(...sentences);
+        pages.push({ pageNum: i, lines: this._groupIntoLines(content.items) });
       } catch (err) {
         console.warn(`PDF Read Aloud: error reading page ${i}`, err);
       }
     }
 
+    if (this.settings.skipHeadersFooters) this._stripHeadersFooters(pages);
+
+    const allSentences = [];
+    for (const pg of pages) {
+      const pageText = this._joinLines(pg.lines).replace(/\s+/g, ' ').trim();
+      if (!pageText) continue;
+      const sentences = this._splitSentences(pageText)
+        .filter(s => s.length > 2)
+        .map(s => ({ text: s, page: pg.pageNum }));
+      allSentences.push(...sentences);
+    }
+
     if (allSentences.length === 0) {
-      new Notice('No readable text found (may be a scanned/image PDF).');
+      const hasTextExtractor = !!this.app.plugins?.plugins?.['text-extractor'];
+      new Notice(
+        'No readable text found — this looks like a scanned/image-only PDF.\n' +
+        (hasTextExtractor
+          ? 'Tip: your Text Extractor plugin can OCR it — extract the text into a note, then read that note aloud.'
+          : 'Tip: run OCR on it first (e.g. the "Text Extractor" community plugin, or Acrobat), then try again.'),
+        10000
+      );
       return null;
     }
+    if (cacheKey) this._extractCache = { key: cacheKey, sentences: allSentences };
     return allSentences;
   }
 
@@ -249,6 +562,7 @@ class PdfReadAloudPlugin extends Plugin {
 
     this.sentences = sentences;
     this._pdfDoc = null;
+    this._activeFilePath = this._getCurrentPdfPath();
 
     let startIdx = 0;
 
@@ -297,6 +611,8 @@ class PdfReadAloudPlugin extends Plugin {
       return;
     }
 
+    this._activeFilePath = this._getCurrentPdfPath();
+
     let sentences = this.sentences;
     if (!sentences || sentences.length === 0) {
       sentences = await this._extractAllPages();
@@ -308,7 +624,7 @@ class PdfReadAloudPlugin extends Plugin {
     let startIdx = -1;
     let endIdx = -1;
 
-    const selSentences = sel.split(/(?<=[.!?])\s+/).map(s => s.trim().toLowerCase()).filter(Boolean);
+    const selSentences = this._splitSentences(sel).map(s => s.toLowerCase()).filter(Boolean);
     const firstSnippet = selSentences[0]?.slice(0, 40) || selLower.slice(0, 40);
     const lastSnippet  = selSentences[selSentences.length - 1]?.slice(0, 40) || selLower.slice(-40);
 
@@ -325,11 +641,9 @@ class PdfReadAloudPlugin extends Plugin {
     if (startIdx === -1) {
       new Notice('Reading selected text directly.');
       this.stop();
-      const rawSentences = sel
-        .replace(/\s+/g, ' ')
-        .split(/(?<=[.!?])\s+/)
-        .filter(s => s.trim().length > 2)
-        .map(s => ({ text: s.trim(), page: 0 }));
+      const rawSentences = this._splitSentences(sel.replace(/\s+/g, ' '))
+        .filter(s => s.length > 2)
+        .map(s => ({ text: s, page: 0 }));
       if (rawSentences.length === 0) {
         new Notice('Selection too short to read.');
         return;
@@ -400,7 +714,7 @@ class PdfReadAloudPlugin extends Plugin {
     while ((node = walker.nextNode())) {
       const text = node.nodeValue;
       for (let i = 0; i < text.length; i++) {
-        if (/\s/.test(text[i])) continue;
+        if (HL_IGNORED.test(text[i])) continue;
         normStr += text[i].toLowerCase();
         domMap.push({ node, offset: i });
       }
@@ -488,7 +802,7 @@ class PdfReadAloudPlugin extends Plugin {
     }
 
     const { normStr, domMap } = this._buildDomMap(textLayer);
-    const target = sentence.text.toLowerCase().replace(/\s+/g, '');
+    const target = sentence.text.toLowerCase().replace(HL_IGNORED_G, '');
     let start = normStr.indexOf(target);
     let len = target.length;
     if (start === -1 && target.length > 40) {
@@ -519,9 +833,9 @@ class PdfReadAloudPlugin extends Plugin {
       end = charIndex + (rest ? rest[0].length : 0);
     }
 
-    // Convert sentence offsets to whitespace-free offsets to index the dom map.
-    const nsBefore = text.slice(0, charIndex).replace(/\s+/g, '').length;
-    const nsLen = text.slice(charIndex, end).replace(/\s+/g, '').length;
+    // Convert sentence offsets to ignored-char-free offsets to index the dom map.
+    const nsBefore = text.slice(0, charIndex).replace(HL_IGNORED_G, '').length;
+    const nsLen = text.slice(charIndex, end).replace(HL_IGNORED_G, '').length;
     if (nsLen === 0) return;
 
     const s = m.start + nsBefore;
@@ -554,6 +868,34 @@ class PdfReadAloudPlugin extends Plugin {
     }
   }
 
+  // ── Position memory ───────────────────────────────────────────────────────────
+
+  _getCurrentPdfPath() {
+    return this._getActiveReadableView()?.file?.path || null;
+  }
+
+  // Only whole-document playback (endIndex === -1) is worth resuming.
+  _savePosition(index) {
+    if (!this.settings.rememberPosition || !this._activeFilePath || this.endIndex >= 0) return;
+    const positions = this.settings.positions || (this.settings.positions = {});
+    positions[this._activeFilePath] = { index, total: this.sentences.length, updated: Date.now() };
+
+    // Keep only the 20 most recently read files.
+    const paths = Object.keys(positions);
+    if (paths.length > 20) {
+      paths.sort((a, b) => positions[a].updated - positions[b].updated);
+      for (const p of paths.slice(0, paths.length - 20)) delete positions[p];
+    }
+    this.saveSettings();
+  }
+
+  _clearPosition() {
+    if (this._activeFilePath && this.settings.positions?.[this._activeFilePath]) {
+      delete this.settings.positions[this._activeFilePath];
+      this.saveSettings();
+    }
+  }
+
   // ── Playback engine ───────────────────────────────────────────────────────────
 
   async play() {
@@ -567,11 +909,22 @@ class PdfReadAloudPlugin extends Plugin {
     }
     if (this.isPlaying) return;
 
-    const sentences = await this._extractAllPages();
+    const sentences = await this._extractForReading();
     if (!sentences) return;
     this.sentences = sentences;
     this.endIndex = -1;
-    this._startPlayback(0);
+    this._activeFilePath = this._getCurrentPdfPath();
+
+    let startIdx = 0;
+    const saved = this.settings.rememberPosition && this._activeFilePath
+      ? this.settings.positions?.[this._activeFilePath]
+      : null;
+    if (saved && saved.index > 0 && saved.index < sentences.length - 1) {
+      startIdx = saved.index;
+      const pg = sentences[startIdx]?.page;
+      new Notice(`Resuming from sentence ${startIdx + 1}${pg ? ` (p.${pg})` : ''} — click the start of the progress bar to start over.`, 5000);
+    }
+    this._startPlayback(startIdx);
   }
 
   _startPlayback(index) {
@@ -588,6 +941,7 @@ class PdfReadAloudPlugin extends Plugin {
       this.isPlaying = false;
       this.isPaused = false;
       this._clearHighlights();
+      if (this.endIndex < 0) this._clearPosition(); // finished the whole document
       this.updateStatusBar('Finished');
       this.refreshPanel();
       new Notice('PDF Read Aloud: Done ✓');
@@ -595,11 +949,46 @@ class PdfReadAloudPlugin extends Plugin {
     }
 
     this.currentIndex = index;
+    if (index % 5 === 0) this._savePosition(index);
     if (this.settings.highlightEnabled) {
       this._highlightSentence(index);
     }
-    const sentence = this.sentences[index].text;
-    const utt = new SpeechSynthesisUtterance(sentence);
+
+    const pg = this.sentences[index]?.page;
+    this.updateStatusBar(`▶ ${index + 1}/${this.sentences.length}${pg ? ` (p.${pg})` : ''}`);
+    this.refreshPanel();
+
+    // Long utterances silently fail on some TTS engines — speak in clause-sized
+    // chunks chained under the same sentence index.
+    const chunks = this._chunkText(this.sentences[index].text, 250);
+    this._speakChunk(index, chunks, 0);
+  }
+
+  _chunkText(text, max = 250) {
+    if (text.length <= max) return [{ text, offset: 0 }];
+    const chunks = [];
+    let pos = 0;
+    while (pos < text.length) {
+      if (text.length - pos <= max) {
+        chunks.push({ text: text.slice(pos), offset: pos });
+        break;
+      }
+      const window = text.slice(pos, pos + max);
+      let cut = -1;
+      for (const sep of ['; ', ', ', ': ', '— ', '– ', ' ']) {
+        const at = window.lastIndexOf(sep);
+        if (at > max * 0.4) { cut = at + sep.length; break; }
+      }
+      if (cut === -1) cut = max;
+      chunks.push({ text: text.slice(pos, pos + cut), offset: pos });
+      pos += cut;
+    }
+    return chunks;
+  }
+
+  _speakChunk(index, chunks, ci) {
+    const chunk = chunks[ci];
+    const utt = new SpeechSynthesisUtterance(chunk.text);
     utt.rate   = this.settings.rate;
     utt.pitch  = this.settings.pitch;
     utt.volume = this.settings.volume;
@@ -612,11 +1001,13 @@ class PdfReadAloudPlugin extends Plugin {
     utt.onboundary = (e) => {
       // Word-boundary events don't fire with every voice — sentence highlight still works.
       if (e.name === 'word' && this.settings.highlightEnabled && this.isPlaying) {
-        this._highlightWord(e.charIndex, e.charLength);
+        this._highlightWord(chunk.offset + e.charIndex, e.charLength);
       }
     };
     utt.onend = () => {
-      if (this.isPlaying && !this.isPaused) this.speakFrom(index + 1);
+      if (!this.isPlaying || this.isPaused) return;
+      if (ci + 1 < chunks.length) this._speakChunk(index, chunks, ci + 1);
+      else this.speakFrom(index + 1);
     };
     utt.onerror = (e) => {
       if (e.error !== 'interrupted' && e.error !== 'canceled') {
@@ -628,9 +1019,6 @@ class PdfReadAloudPlugin extends Plugin {
     };
 
     this.utterance = utt;
-    const pg = this.sentences[index]?.page;
-    this.updateStatusBar(`▶ ${index + 1}/${this.sentences.length}${pg ? ` (p.${pg})` : ''}`);
-    this.refreshPanel();
     this.synth.speak(utt);
   }
 
@@ -639,12 +1027,14 @@ class PdfReadAloudPlugin extends Plugin {
     this.synth.pause();
     this.isPaused = true;
     this.isPlaying = false;
+    this._savePosition(this.currentIndex);
     this.updateStatusBar('Paused');
     this.refreshPanel();
   }
 
   stop() {
     this.synth.cancel();
+    if (this.isPlaying || this.isPaused) this._savePosition(this.currentIndex);
     this.isPlaying = false;
     this.isPaused = false;
     this.currentIndex = 0;
@@ -672,6 +1062,18 @@ class PdfReadAloudPlugin extends Plugin {
 
   updateStatusBar(msg) {
     if (this.statusBarEl) this.statusBarEl.setText(`🔊 ${msg}`);
+  }
+
+  // Voices sorted best-first: premium/natural voices, then the UI language, then A–Z.
+  getSortedVoices() {
+    const uiLang = (navigator.language || 'en').slice(0, 2).toLowerCase();
+    const quality = v => /natural|premium|enhanced|neural/i.test(v.name) ? 0 : 1;
+    const langRank = v => (v.lang || '').slice(0, 2).toLowerCase() === uiLang ? 0 : 1;
+    return [...window.speechSynthesis.getVoices()].sort((a, b) =>
+      (quality(a) - quality(b)) ||
+      (langRank(a) - langRank(b)) ||
+      a.name.localeCompare(b.name)
+    );
   }
 
   refreshPanel() {
@@ -867,7 +1269,7 @@ class ControlPanelView extends ItemView {
     c.appendChild(skipSlider);
 
     // ── Voice ─────────────────────────────────────────────────────────────────
-    const voices = window.speechSynthesis.getVoices();
+    const voices = p.getSortedVoices();
     if (voices.length > 0) {
       const voiceLabel = c.createEl('div', { text: 'Voice' });
       voiceLabel.style.cssText = 'font-size:12px;color:var(--text-muted);margin-bottom:4px;';
@@ -890,7 +1292,7 @@ class ControlPanelView extends ItemView {
     tips.style.cssText = 'font-size:11px;color:var(--text-muted);line-height:1.6;margin-top:4px;';
 
     const tipLines = [
-      ['Play', '— reads whole PDF from beginning'],
+      ['Play', '— reads the open PDF or note aloud'],
       ['Read from click', '— then click anywhere in PDF text'],
       ['Read selection', '— highlight text first, then click'],
       ['Right-click', '— quick access inside the PDF viewer'],
@@ -921,6 +1323,24 @@ class PdfReadAloudSettingTab extends PluginSettingTab {
     slider('Pitch',        'Voice pitch',                      'pitch',    0.5, 2.0, 0.1);
     slider('Volume',       'Volume level',                     'volume',   0.0, 1.0, 0.1);
     slider('Skip size',    'Sentences to skip forward/back',   'skipSize', 1,   20,  1);
+
+    new Setting(containerEl)
+      .setName('Remember reading position')
+      .setDesc('Resume each PDF from where you last stopped (kept for the 20 most recent files)')
+      .addToggle(t => t.setValue(this.plugin.settings.rememberPosition)
+        .onChange(async v => { this.plugin.settings.rememberPosition = v; await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName('Multi-column detection')
+      .setDesc('Detect two-column page layouts and read the left column before the right (turn off if reading order seems wrong)')
+      .addToggle(t => t.setValue(this.plugin.settings.columnDetection)
+        .onChange(async v => { this.plugin.settings.columnDetection = v; await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName('Skip headers, footers and page numbers')
+      .setDesc('Detect lines repeated at the top/bottom of pages (running titles, page numbers) and skip them while reading')
+      .addToggle(t => t.setValue(this.plugin.settings.skipHeadersFooters)
+        .onChange(async v => { this.plugin.settings.skipHeadersFooters = v; await this.plugin.saveSettings(); }));
 
     new Setting(containerEl)
       .setName('Highlight while reading')
@@ -978,13 +1398,25 @@ class PdfReadAloudSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Voice')
-      .setDesc('Text-to-speech voice (uses voices installed on your system)')
+      .setDesc('Text-to-speech voice (uses voices installed on your system, best ones listed first)')
       .addDropdown(drop => {
-        const voices = window.speechSynthesis.getVoices();
+        const voices = this.plugin.getSortedVoices();
         voices.forEach(v => drop.addOption(v.voiceURI, `${v.name} (${v.lang})`));
         drop.setValue(this.plugin.settings.voiceURI);
         drop.onChange(async v => { this.plugin.settings.voiceURI = v; await this.plugin.saveSettings(); });
       });
+
+    const voiceTip = containerEl.createEl('div');
+    voiceTip.style.cssText = 'font-size:12px;color:var(--text-muted);line-height:1.6;margin-top:6px;';
+    const tipTitle = voiceTip.createEl('b');
+    tipTitle.setText('Want better-sounding voices?');
+    const tipList = voiceTip.createEl('ul');
+    tipList.style.cssText = 'margin:4px 0 0 0;padding-left:18px;';
+    [
+      'Windows: Settings → Time & Language → Speech → Add voices (natural voices on Windows 11)',
+      'macOS: System Settings → Accessibility → Spoken Content → System Voice → Manage Voices (Siri/Premium voices)',
+      'Restart Obsidian after installing — new voices appear in the list above.',
+    ].forEach(t => tipList.createEl('li').setText(t));
   }
 }
 

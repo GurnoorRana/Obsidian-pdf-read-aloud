@@ -82,6 +82,20 @@ Highlight colors can also be changed directly from the control panel.
 
 ## Changelog
 
+### 1.3.0
+- Read **Markdown notes** aloud too — press Play with a note active (markdown syntax is stripped, code blocks skipped)
+- **Resume position**: each PDF continues from where you last stopped (toggleable, last 20 files)
+- Smarter sentence splitting: abbreviations (Dr., e.g., No. 5), initials and decimals no longer break sentences
+- Words hyphenated across line breaks are rejoined ("adven-ture" → "adventure")
+- Repeated headers, footers and page numbers are detected and skipped (toggleable)
+- Two-column layouts are detected and read in the correct order (toggleable)
+- Extracted text is cached per file — replaying an unchanged PDF starts instantly
+- Playback stops automatically (saving your position) when the file being read is closed
+- Very long sentences are split into clause-sized chunks so voices no longer cut out on them
+- Scanned/image-only PDFs now get an OCR tip (detects the Text Extractor plugin)
+- Voice lists are sorted best-first, with in-settings tips for installing better system voices
+- Marked as desktop-only pending mobile testing
+
 ### 1.2.0
 - **Follow-along highlighting**: the sentence being read is highlighted in the PDF, and the current word gets a stronger highlight (word-level tracking depends on the selected voice supporting word-boundary events)
 - Auto-scroll keeps the highlighted sentence in view, including jumping to not-yet-rendered pages
